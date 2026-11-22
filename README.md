@@ -45,6 +45,44 @@ cortex snapshot restore <id>
 cortex forget --subject project   # GDPR-style permanent scrub
 ```
 
+## What's new in 0.2.0
+
+- **Real fact extraction** (`extract.py`): role-gated, precision-first rules for preferences, decisions, stack,
+  file facts, and evidence-based command success/failure read from tool output. Error + edit + passing re-run
+  becomes one `error-fix` memory. No LLM or API key needed; an optional, validated LLM hook exists
+  (`register_llm_extractor`). Set `CORTEX_DEBUG=1` for a counters-only diagnostics log (never message content).
+- **Git-root namespaces + global fallback**: every subdirectory of a repo is one project; personal preferences live in
+  `global:user` and follow you across projects; retrieval fuses per-namespace BM25 rankings with weighted RRF.
+- **MCP server** (`python -m cortex_memory.mcp_server`): `memory_save`, `memory_query`, `memory_forget`, `memory_status`.
+- **Hardened forget**: permanent forget also erases the source episodes and scrubs existing snapshots.
+- **Token Savior migration** (`python -m cortex_memory.migration export|import|validate`): idempotent, read-only source.
+- Schema v2 upgrades existing databases automatically; hooks can no longer fail silently on a fresh install.
+
+### MCP setup
+
+```bash
+pip install -e ".[mcp]"
+claude mcp add --scope user cortex-memory -- python -m cortex_memory.mcp_server
+```
+
+### Migrating from Token Savior
+
+```bash
+python -m cortex_memory.migration export --out ts.jsonl      # source DB opened read-only
+python -m cortex_memory.migration import --in ts.jsonl --dry-run
+python -m cortex_memory.migration import --in ts.jsonl
+python -m cortex_memory.migration validate --in ts.jsonl
+```
+
+Then remove Token Savior's `memory-*.sh` hook entries from `settings.json` (`TS_MEMORY_DISABLE=1` only reaches hooks
+that inherit it from Claude Code's environment, so removing the entries is the reliable switch).
+
+### Tests
+
+```bash
+pip install -e ".[test]" && pytest -q
+```
+
 ## Credits — this is a Frankenstein build
 
 This project doesn't claim original research. It's a synthesis: concrete design ideas pulled from four existing open-source agent-memory projects, combined into one coherent system and implemented from scratch (no code copied from any of them).

@@ -217,10 +217,19 @@ _ERROR_LINE = re.compile(
     r".*command not found.*|.*No such file or directory.*|.*Permission denied.*|ModuleNotFoundError.*))$", re.M)
 
 
+_ENV_PREFIX = re.compile(r"^(?:\s*[A-Za-z_][A-Za-z0-9_]*=\S*\s*(?:&&|;)?\s*)+")
+_EXE_PATH = re.compile(r"^(?:\"[^\"]*[/\\]|\S*[/\\])(python[\d.]*|pytest|node|npm)(?:\.exe)?(?=\s|$)", re.I)
+_TAIL = re.compile(r"\s*(?:2>&1|\|\||\||>>?|<<).*$")
+
+
 def normalize_command(cmd: str) -> str:
+    """Reduce a shell line to the command that matters: no cd/env prefixes, no pipe/redirect tail."""
     if not isinstance(cmd, str):
         return ""
     cmd = _CD_PREFIX.sub("", cmd)
+    cmd = _ENV_PREFIX.sub("", cmd)
+    cmd = _TAIL.sub("", cmd)
+    cmd = _EXE_PATH.sub(lambda m: m.group(1).lower().replace(".exe", ""), cmd)
     cmd = re.sub(r"\s+", " ", cmd).strip()
     return cmd[:120]
 

@@ -35,14 +35,17 @@ def canonical_root(cwd: str | os.PathLike | None) -> str | None:
     try:
         p = Path(cwd).expanduser()
         p = Path(os.path.realpath(p))          # resolves symlinks, normalises `..`
-        start = p if p.is_dir() else p.parent
-        node = start
-        for candidate in (node, *node.parents):
-            if (candidate / ".git").exists():
-                node = candidate
-                break
+        if not p.exists():
+            node = p                            # unknown here (e.g. imported from another machine): keep as-is
         else:
+            start = p if p.is_dir() else p.parent
             node = start
+            for candidate in (node, *node.parents):
+                if (candidate / ".git").exists():
+                    node = candidate
+                    break
+            else:
+                node = start
         root = node.as_posix()
         if os.name == "nt":                     # case-insensitive filesystem
             root = root.lower()

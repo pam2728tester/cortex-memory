@@ -133,3 +133,14 @@ def test_llm_hook_validated():
         assert [c.object for c in out] == ["Use WAL mode for SQLite"]
     finally:
         extract.register_llm_extractor(None)
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("cd /repo && pytest -q 2>&1 | tail -5", "pytest -q"),
+    ('PY=/c/Python312/python.exe && "$PY" -m pytest -q', '"$PY" -m pytest -q'),
+    ("CI=1 npm test > out.txt", "npm test"),
+    ("C:/Python312/python.exe -m pytest tests/", "python -m pytest tests/"),
+    ("pytest -q", "pytest -q"),
+])
+def test_normalize_command(raw, expected):
+    assert extract.normalize_command(raw) == expected
