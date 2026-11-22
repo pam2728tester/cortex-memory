@@ -9,7 +9,7 @@ design rule. Extend TRACKED_TOOLS if more signal is needed.
 import json
 import sys
 
-from _shared import read_hook_input, safe_namespace
+from _shared import read_hook_input, safe_namespace, run_safely
 
 sys.path.insert(0, str(__file__).rsplit("cortex_memory", 1)[0])
 from cortex_memory import capture, db  # noqa: E402
@@ -39,6 +39,7 @@ def main():
             capture.ingest(
                 conn, ns, "tool_failure" if is_error else "tool_result", content,
                 summary=summary, source_type="tool_observed",
+                tool=(tool_name, tool_input, tool_response),
                 importance=0.6 if is_error else 0.4,
             )
         finally:
@@ -49,4 +50,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_safely(main)

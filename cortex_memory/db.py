@@ -230,24 +230,34 @@ def db_path() -> Path:
     return data_dir() / "cortex.db"
 
 
-def connect() -> sqlite3.Connection:
+def connect(auto_init: bool = True) -> sqlite3.Connection:
+    """Open the DB. A missing schema is created on first use so a hook never
+    fails silently just because `cortex init` was not run."""
     conn = sqlite3.connect(db_path(), isolation_level=None)  # autocommit; callers wrap explicit transactions
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    if auto_init and not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='namespaces'"
+    ).fetchone():
+        _apply_schema(conn)
     return conn
 
 
+def _apply_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(SCHEMA)
+    row = conn.execute("SELECT MAX(version) AS v FROM schema_migrations").fetchone()
+    if row["v"] is None:
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?, datetime('now'))",
+            (SCHEMA_VERSION,),
+        )
+    ensure_default_namespace(conn)
+
+
 def init_db() -> None:
-    conn = connect()
+    conn = connect(auto_init=False)
     try:
-        conn.executescript(SCHEMA)
-        row = conn.execute("SELECT MAX(version) AS v FROM schema_migrations").fetchone()
-        if row["v"] is None:
-            conn.execute(
-                "INSERT INTO schema_migrations (version, applied_at) VALUES (?, datetime('now'))",
-                (SCHEMA_VERSION,),
-            )
-        ensure_default_namespace(conn)
+        _apply_schema(conn)
     finally:
         conn.close()
 

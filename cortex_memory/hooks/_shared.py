@@ -16,7 +16,8 @@ from cortex_memory import capture, db, retrieve  # noqa: E402
 def read_hook_input() -> dict:
     try:
         raw = sys.stdin.read()
-        return json.loads(raw) if raw.strip() else {}
+        data = json.loads(raw) if raw.strip() else {}
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
@@ -42,3 +43,14 @@ def safe_namespace(cwd: str | None) -> str:
         return db.get_or_create_namespace(conn, name, "project" if cwd else "global")
     finally:
         conn.close()
+
+
+def run_safely(main) -> None:
+    """Entry-point guard: a hook may never fail the agent, whatever stdin held."""
+    try:
+        main()
+    except SystemExit:
+        pass
+    except BaseException:
+        pass
+    sys.exit(0)

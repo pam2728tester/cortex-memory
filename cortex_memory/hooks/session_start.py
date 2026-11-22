@@ -3,7 +3,7 @@
 
 import sys
 
-from _shared import additional_context, read_hook_input, safe_namespace
+from _shared import additional_context, read_hook_input, safe_namespace, run_safely
 
 sys.path.insert(0, str(__file__).rsplit("cortex_memory", 1)[0])
 from cortex_memory import db, retrieve  # noqa: E402
@@ -28,4 +28,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_safely(main)

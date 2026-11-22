@@ -8,10 +8,11 @@ the only code path allowed to write to `facts`.
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass, field
 
-from . import db
+from . import db, extract
 from .privacy import sanitize_for_capture
 
 # ---------------------------------------------------------------------------
@@ -64,33 +65,21 @@ class CandidateFact:
     source_episode_id: str | None = None
 
 
-RULES = [
-    # "I prefer X" / "please always answer in X"
-    (re.compile(r"(?i)\bi prefer ([a-z0-9 _\-]{2,40})\b"), "user", "preference"),
-    (re.compile(r"(?i)\bplease always ([a-z0-9 _\-]{2,60})\b"), "user", "instruction"),
-    (re.compile(r"(?i)\balways ([a-z0-9 _\-]{2,60}) before\b"), "project", "rule"),
-    # "the project uses X" / "we use X for Y"
-    (re.compile(r"(?i)\bthe project uses ([a-z0-9 _\-\.]{2,40})\b"), "project", "uses"),
-    (re.compile(r"(?i)\buses? ([a-z0-9 _\-\.]{2,40}) as (?:the|its) (database|cache|queue|test framework)\b"),
-     "project", "uses_component"),
-]
-
-# A question is not evidence of its implied statement. Never extract from these.
+# A question is not evidence of its implied statement. Kept for back-compat;
+# extract.py also rejects questions sentence by sentence.
 QUESTION_PATTERN = re.compile(r"\?\s*$")
+
+TOOL_EVENT_TYPES = {"tool_result", "tool_failure"}
 
 
 def extract_candidates(content: str, episode_id: str) -> list[CandidateFact]:
-    if QUESTION_PATTERN.search(content.strip()):
-        return []
-    out = []
-    for pattern, subject, predicate in RULES:
-        for m in pattern.finditer(content):
-            obj = m.group(1).strip().rstrip(".")
-            if not obj:
-                continue
-            out.append(CandidateFact(subject=subject, predicate=predicate, object=obj,
-                                      source_episode_id=episode_id))
-    return out
+    """User-text extraction (see extract.py for the rule set)."""
+    return [_to_fact(c, episode_id) for c in extract.extract_text(content)]
+
+
+def _to_fact(c: "extract.Candidate", episode_id: str) -> CandidateFact:
+    return CandidateFact(subject=c.subject, predicate=c.predicate, object=c.object,
+                         confidence=c.confidence, source_episode_id=episode_id)
 
 
 # ---------------------------------------------------------------------------
@@ -147,20 +136,82 @@ def merge_fact(conn, namespace_id, candidate: CandidateFact) -> tuple[str, str]:
     return fid, "supersede"
 
 
-def ingest(conn, namespace_id, event_type, content, **kwargs) -> dict:
-    """Full write-path entry point: capture an episode, then extract+merge facts."""
+def ingest(conn, namespace_id, event_type, content, tool=None, **kwargs) -> dict:
+    """Full write-path entry point: capture an episode, then extract+merge facts.
+
+    `tool` = (tool_name, tool_input, tool_response) for tool events: facts are
+    then read from structured evidence rather than from the flattened content.
+    Returns stats (counts only, never content) so a silent pipeline can be diagnosed.
+    """
+    stats = extract.Stats()
     episode_id, was_new = capture_episode(conn, namespace_id, event_type, content, **kwargs)
-    results = {"episode_id": episode_id, "was_new": was_new, "facts": []}
+    results = {"episode_id": episode_id, "was_new": was_new, "facts": [], "stats": stats}
     if not was_new:
         return results
     quarantined = conn.execute("SELECT is_quarantined FROM episodes WHERE id=?", (episode_id,)).fetchone()
     if quarantined and quarantined["is_quarantined"]:
         # Untrusted content: keep as evidence, never promote to a fact automatically.
         return results
-    for candidate in extract_candidates(content, episode_id):
-        fid, op = merge_fact(conn, namespace_id, candidate)
-        results["facts"].append({"fact_id": fid, "op": op, "predicate": candidate.predicate})
+    if tool is not None:
+        cands = extract.extract_tool(*tool, stats=stats)
+    elif event_type in TOOL_EVENT_TYPES:
+        cands = []   # never mine facts out of flattened tool output
+    else:
+        cands = extract.extract_text(content, stats)
+        cands += extract.extract_llm(content, stats)
+    for cand in cands:
+        if cand.kind == "command":
+            _pair_error_fix(conn, namespace_id, cand, episode_id, results)
+        fid, op = merge_fact(conn, namespace_id, _to_fact(cand, episode_id))
+        results["facts"].append({"fact_id": fid, "op": op, "predicate": cand.predicate, "kind": cand.kind})
+    _log_stats(event_type, stats, len(results["facts"]))
     return results
+
+
+def _pair_error_fix(conn, namespace_id, success: "extract.Candidate", episode_id, results) -> None:
+    """A passing command that previously failed, with edits in between, becomes one error_fix fact."""
+    err_pred = "error:" + success.predicate.split(":", 1)[1]
+    err = conn.execute(
+        "SELECT id, object, recorded_at FROM facts WHERE namespace_id=? AND predicate=? AND status='active'",
+        (namespace_id, err_pred),
+    ).fetchone()
+    if not err:
+        return
+    edited = []
+    for row in conn.execute(
+        """SELECT content FROM episodes WHERE namespace_id=? AND event_type='tool_result'
+           AND recorded_at >= ? AND (content LIKE 'Edit succeeded%' OR content LIKE 'Write succeeded%')
+           ORDER BY recorded_at""",
+        (namespace_id, err["recorded_at"]),
+    ):
+        m = re.search(r'"file_path":\s*"((?:[^"\\]|\\.)*)"', row["content"])
+        if m:
+            # json.dumps escaped Windows backslashes; normalise to "/" and keep the basename.
+            name = m.group(1).replace("\\\\", "/").replace("\\", "/").rsplit("/", 1)[-1]
+            if name not in edited:
+                edited.append(name)
+    if not edited:
+        return   # no evidence of a fix: leave the error standing
+    detail = err["object"].split(": ", 1)[-1][:120]
+    cmd = success.object.split("`")[1]
+    obj = f"`{cmd}` failed with '{detail}' and passed after editing {', '.join(edited[:4])}"
+    fid, op = merge_fact(conn, namespace_id, CandidateFact(
+        subject="project", predicate="error_fix:" + success.predicate.split(":", 1)[1],
+        object=obj, confidence=0.85, source_episode_id=episode_id))
+    conn.execute("UPDATE facts SET status='superseded', superseded_at=datetime('now') WHERE id=?", (err["id"],))
+    results["facts"].append({"fact_id": fid, "op": op, "predicate": "error_fix", "kind": "error_fix"})
+
+
+def _log_stats(event_type: str, stats: "extract.Stats", saved: int) -> None:
+    """Opt-in (CORTEX_DEBUG=1) counters-only JSONL log; never writes message content."""
+    if os.environ.get("CORTEX_DEBUG") != "1":
+        return
+    try:
+        path = os.path.join(str(db.DEFAULT_DATA_DIR), "capture_stats.jsonl")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"event_type": event_type, "saved": saved, **stats.as_dict()}) + "\n")
+    except Exception:
+        pass
 
 
 def _link_source(conn, memory_type, memory_id, episode_id, contribution_type):
