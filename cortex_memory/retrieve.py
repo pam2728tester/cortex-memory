@@ -12,13 +12,14 @@ RRF_K = 60
 DEFAULT_TOKEN_BUDGET = 1900
 
 
-def _bm25_facts(conn, namespace_id, query_text, limit=20):
+def _bm25_facts(conn, namespace_id, query_text, limit=20, include_superseded=False):
+    statuses = "('active','superseded')" if include_superseded else "('active')"
     rows = conn.execute(
-        """SELECT f.id, f.subject, f.predicate, f.object, f.confidence, f.importance,
-                  f.last_accessed_at, f.access_count, bm25(facts_fts) AS score
-           FROM facts_fts JOIN facts f ON f.rowid = facts_fts.rowid
-           WHERE facts_fts MATCH ? AND f.namespace_id = ? AND f.status = 'active'
-           ORDER BY score LIMIT ?""",
+        f"""SELECT f.id, f.subject, f.predicate, f.object, f.confidence, f.importance, f.status,
+                   f.recorded_at, f.last_accessed_at, f.access_count, bm25(facts_fts) AS score
+            FROM facts_fts JOIN facts f ON f.rowid = facts_fts.rowid
+            WHERE facts_fts MATCH ? AND f.namespace_id = ? AND f.status IN {statuses}
+            ORDER BY score LIMIT ?""",
         (query_text, namespace_id, limit),
     ).fetchall()
     return rows
@@ -36,7 +37,7 @@ def _bm25_episodes(conn, namespace_id, query_text, limit=20):
     return rows
 
 
-def _graph_expand(conn, namespace_id, query_text, hops=1, limit=20):
+def _graph_expand(conn, namespace_id, query_text, hops=1, limit=20):  # noqa: ARG001
     """Expand from entities whose canonical_name appears in the query text."""
     terms = [t for t in query_text.lower().split() if len(t) > 2]
     if not terms:
@@ -60,7 +61,8 @@ def _graph_expand(conn, namespace_id, query_text, hops=1, limit=20):
         return []
     placeholders2 = ",".join("?" * len(fact_ids))
     return conn.execute(
-        f"""SELECT id, subject, predicate, object, confidence, importance, last_accessed_at, access_count
+        f"""SELECT id, subject, predicate, object, confidence, importance, status, recorded_at,
+                   last_accessed_at, access_count
             FROM facts WHERE id IN ({placeholders2}) AND status='active'""",
         fact_ids,
     ).fetchall()
@@ -86,10 +88,15 @@ def _rrf_merge(*ranked_lists, weights=None):
     return scores
 
 
-def query(conn, namespace_id, text, limit=10, token_budget=DEFAULT_TOKEN_BUDGET,
-          global_namespace_id=None, min_confidence=0.0, exclude_episode_ids=(),
-          include_global=True):
-    """Full read-path entry point. Returns an assembled context dict.
+def query(conn, namespace_id, text, limit=10, token_budget=DEFAULT_TOKEN_BUDGET, **kwargs):
+    """Full read-path entry point. Returns an assembled context dict (see `search` for kwargs)."""
+    scored, episodes = search(conn, namespace_id, text, limit=limit, **kwargs)
+    return _assemble_context(namespace_id, scored, episodes, token_budget)
+
+
+def search(conn, namespace_id, text, limit=10, global_namespace_id=None, min_confidence=0.0,
+           exclude_episode_ids=(), include_global=True, include_superseded=False):
+    """Ranked retrieval. Returns ([(score, fact_row, scope_label)], [episode_rows]).
 
     Searches the project namespace and (by default) the global one. Each
     namespace gets its OWN BM25 ranking (raw BM25 scores are not comparable
@@ -110,7 +117,7 @@ def query(conn, namespace_id, text, limit=10, token_budget=DEFAULT_TOKEN_BUDGET,
     ranked, weights, fact_rows, ns_of = [], [], {}, {}
     episodes = []
     for ns_id, w_fts, w_graph, label in scopes:
-        bm25 = list(_bm25_facts(conn, ns_id, fts_query))
+        bm25 = list(_bm25_facts(conn, ns_id, fts_query, include_superseded=include_superseded))
         graph = list(_graph_expand(conn, ns_id, text))
         ranked += [bm25, graph]
         weights += [w_fts, w_graph]
@@ -142,7 +149,7 @@ def query(conn, namespace_id, text, limit=10, token_budget=DEFAULT_TOKEN_BUDGET,
             (row["id"],),
         )
     episodes.sort(key=lambda le: (le[0] != "project",))   # project history first (stable)
-    return _assemble_context(namespace_id, scored, [e for _, e in episodes][:5], token_budget)
+    return scored, [e for _, e in episodes][:5]
 
 
 def _recency_score(last_accessed_at) -> float:

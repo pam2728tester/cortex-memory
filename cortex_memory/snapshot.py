@@ -77,34 +77,95 @@ def restore(snapshot_id: str) -> dict:
     return {"restored": snapshot_id, "safety_snapshot": pre_restore["snapshot_id"]}
 
 
-def forget(namespace_id: str, subject: str | None = None, fact_id: str | None = None) -> dict:
-    """Permanently scrub a fact (or all facts matching a subject) from the database."""
+def _scrub(conn, fact_ids: list[str], episode_ids: list[str]) -> None:
+    """Erase content of the given facts/episodes in-place (FTS triggers keep indexes in sync)."""
+    for fid in fact_ids:
+        conn.execute(
+            "UPDATE facts SET subject='[FORGOTTEN]', predicate='[FORGOTTEN]', object='[FORGOTTEN]', status='deleted' WHERE id = ?",
+            (fid,))
+        conn.execute("DELETE FROM fact_meta WHERE fact_id = ?", (fid,))
+        conn.execute("DELETE FROM memory_sources WHERE memory_type='fact' AND memory_id = ?", (fid,))
+    for eid in episode_ids:
+        conn.execute(
+            "UPDATE episodes SET content='[FORGOTTEN]', summary=NULL, status='deleted', "
+            "content_hash='forgotten:' || id WHERE id = ?", (eid,))
+
+
+def _scrub_snapshots(fact_ids: list[str], episode_ids: list[str]) -> int:
+    """Old snapshots would resurrect forgotten data on restore, so scrub them too and re-seal the checksum."""
+    live = db.connect()
+    try:
+        rows = live.execute("SELECT id, file_path FROM snapshots").fetchall()
+        n = 0
+        for row in rows:
+            path = Path(row["file_path"])
+            if not path.exists():
+                continue
+            c = sqlite3.connect(path)
+            try:
+                c.execute("PRAGMA secure_delete=ON")
+                _scrub(c, fact_ids, episode_ids)
+                c.commit()
+            except sqlite3.Error:
+                c.close()
+                continue          # unreadable/legacy snapshot: leave it, report via count
+            c.close()
+            checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+            live.execute("UPDATE snapshots SET checksum=? WHERE id=?", (checksum, row["id"]))
+            manifest = path.with_suffix("").with_suffix(".manifest.json")
+            if manifest.exists():
+                m = json.loads(manifest.read_text())
+                m["checksum"] = checksum
+                manifest.write_text(json.dumps(m, indent=2))
+            n += 1
+        return n
+    finally:
+        live.close()
+
+
+def forget(namespace_id: str, subject: str | None = None, fact_id: str | None = None,
+           scrub_snapshots: bool = True) -> dict:
+    """Permanently erase a fact (or all facts for a subject), the episodes it was
+    derived from, and the same data inside existing snapshots.
+
+    Deliberately separate from supersession: supersession keeps history, forget erases it.
+    When fact_id is given it must belong to namespace_id.
+    """
     conn = db.connect()
     try:
         if fact_id:
-            where, params = "id = ?", (fact_id,)
+            where, params = "id = ? AND namespace_id = ?", (fact_id, namespace_id)
         elif subject:
             where, params = "namespace_id = ? AND subject = ?", (namespace_id, subject)
         else:
             raise ValueError("forget() requires fact_id or subject")
 
-        rows = conn.execute(f"SELECT id FROM facts WHERE {where}", params).fetchall()
+        fact_ids = [r["id"] for r in conn.execute(f"SELECT id FROM facts WHERE {where}", params).fetchall()]
+        episode_ids = []
+        for fid in fact_ids:
+            for r in conn.execute(
+                "SELECT DISTINCT episode_id FROM memory_sources WHERE memory_type='fact' AND memory_id=?", (fid,)):
+                if r["episode_id"] not in episode_ids:
+                    episode_ids.append(r["episode_id"])
         rid = db.new_id()
-        conn.execute(
-            "INSERT INTO forget_requests (id, namespace_id, target_type, target_id, subject, requested_at, status) "
-            "VALUES (?, ?, 'fact', ?, ?, datetime('now'), 'completed')",
-            (rid, namespace_id, fact_id, subject),
-        )
-        for row in rows:
+        conn.execute("BEGIN")
+        try:
             conn.execute(
-                "UPDATE facts SET subject='[FORGOTTEN]', predicate='[FORGOTTEN]', object='[FORGOTTEN]', status='deleted' WHERE id = ?",
-                (row["id"],),
+                "INSERT INTO forget_requests (id, namespace_id, target_type, target_id, subject, requested_at, status) "
+                "VALUES (?, ?, 'fact', ?, ?, datetime('now'), 'completed')",
+                (rid, namespace_id, fact_id, subject),
             )
-            conn.execute("DELETE FROM memory_sources WHERE memory_type='fact' AND memory_id = ?", (row["id"],))
-            conn.execute(
-                "INSERT INTO audit_log (id, ts, operation, memory_type, memory_id, detail_json) VALUES (?, datetime('now'), 'forget', 'fact', ?, '{}')",
-                (db.new_id(), row["id"]),
-            )
-        return {"request_id": rid, "scrubbed": len(rows)}
+            _scrub(conn, fact_ids, episode_ids)
+            for fid in fact_ids:
+                conn.execute(
+                    "INSERT INTO audit_log (id, ts, operation, memory_type, memory_id, detail_json) "
+                    "VALUES (?, datetime('now'), 'forget', 'fact', ?, '{}')", (db.new_id(), fid))
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
     finally:
         conn.close()
+    snaps = _scrub_snapshots(fact_ids, episode_ids) if (scrub_snapshots and fact_ids) else 0
+    return {"request_id": rid, "scrubbed": len(fact_ids), "episodes_scrubbed": len(episode_ids),
+            "snapshots_scrubbed": snaps, "fact_ids": fact_ids}

@@ -6,7 +6,7 @@ import uuid
 from pathlib import Path
 
 DEFAULT_DATA_DIR = Path(os.environ.get("CORTEX_MEMORY_DIR", os.path.expanduser("~/.cortex-memory")))
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -213,6 +213,25 @@ CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
     INSERT INTO facts_fts(facts_fts, rowid, subject, predicate, object) VALUES ('delete', old.rowid, old.subject, old.predicate, old.object);
     INSERT INTO facts_fts(rowid, subject, predicate, object) VALUES (new.rowid, new.subject, new.predicate, new.object);
 END;
+
+-- v2: tags/metadata/source for facts saved through the MCP server or importer.
+CREATE TABLE IF NOT EXISTS fact_meta (
+    fact_id TEXT PRIMARY KEY,
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    source TEXT,
+    FOREIGN KEY(fact_id) REFERENCES facts(id)
+);
+
+-- v2: idempotent imports from other memory systems (e.g. Token Savior).
+CREATE TABLE IF NOT EXISTS import_ledger (
+    source_system TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    target_memory_id TEXT NOT NULL,
+    imported_at TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    PRIMARY KEY (source_system, source_id)
+);
 """
 
 
@@ -231,24 +250,30 @@ def db_path() -> Path:
 
 
 def connect(auto_init: bool = True) -> sqlite3.Connection:
-    """Open the DB. A missing schema is created on first use so a hook never
-    fails silently just because `cortex init` was not run."""
-    conn = sqlite3.connect(db_path(), isolation_level=None)  # autocommit; callers wrap explicit transactions
+    """Open the DB. A missing or older schema is created/upgraded on first use so a
+    hook never fails silently just because `cortex init` was not run."""
+    conn = sqlite3.connect(db_path(), isolation_level=None, timeout=10)  # autocommit; callers wrap explicit transactions
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
-    if auto_init and not conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='namespaces'"
-    ).fetchone():
+    conn.execute("PRAGMA secure_delete=ON")   # freed pages are zeroed: forgotten text must not linger on disk
+    if auto_init and _schema_version(conn) < SCHEMA_VERSION:
         _apply_schema(conn)
     return conn
 
 
+def _schema_version(conn: sqlite3.Connection) -> int:
+    try:
+        row = conn.execute("SELECT MAX(version) AS v FROM schema_migrations").fetchone()
+        return row["v"] or 0
+    except sqlite3.OperationalError:
+        return 0
+
+
 def _apply_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(SCHEMA)
-    row = conn.execute("SELECT MAX(version) AS v FROM schema_migrations").fetchone()
-    if row["v"] is None:
+    conn.executescript(SCHEMA)          # every statement is IF NOT EXISTS: safe to re-run as an upgrade
+    if _schema_version(conn) < SCHEMA_VERSION:
         conn.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (?, datetime('now'))",
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, datetime('now'))",
             (SCHEMA_VERSION,),
         )
     ensure_default_namespace(conn)

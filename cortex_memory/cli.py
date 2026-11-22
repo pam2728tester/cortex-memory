@@ -85,7 +85,18 @@ def cmd_snapshot_restore(args):
 
 
 def cmd_forget(args):
-    print(json.dumps(snapshot.forget(args.namespace or "global:user", subject=args.subject, fact_id=args.fact_id), indent=2))
+    conn = db.connect()
+    try:
+        if args.fact_id and not args.namespace:
+            row = conn.execute("SELECT namespace_id FROM facts WHERE id=?", (args.fact_id,)).fetchone()
+            ns = row["namespace_id"] if row else None
+        else:
+            ns = _resolve_namespace(conn, args.namespace)
+    finally:
+        conn.close()
+    if ns is None:
+        sys.exit(f"unknown fact {args.fact_id}")
+    print(json.dumps(snapshot.forget(ns, subject=args.subject, fact_id=args.fact_id), indent=2))
 
 
 def main():

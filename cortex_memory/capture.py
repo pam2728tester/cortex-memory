@@ -86,6 +86,11 @@ def _to_fact(c: "extract.Candidate", episode_id: str) -> CandidateFact:
 # Step 5-6: merger. Sole writer to `facts`. Reinforce / supersede / insert.
 # ---------------------------------------------------------------------------
 
+def _norm(text: str) -> str:
+    """Case/whitespace/punctuation-insensitive form used to decide 'same belief'."""
+    return re.sub(r"\W+", " ", text.lower()).strip()
+
+
 def merge_fact(conn, namespace_id, candidate: CandidateFact) -> tuple[str, str]:
     """Apply one candidate fact. Returns (fact_id, operation)."""
     existing = conn.execute(
@@ -106,7 +111,7 @@ def merge_fact(conn, namespace_id, candidate: CandidateFact) -> tuple[str, str]:
         _audit(conn, "insert", "fact", fid, {"subject": candidate.subject, "predicate": candidate.predicate})
         return fid, "insert"
 
-    if existing["object"].strip().lower() == candidate.object.strip().lower():
+    if _norm(existing["object"]) == _norm(candidate.object):
         # Reinforcement: same belief, independent evidence.
         conn.execute(
             """UPDATE facts SET confidence = MIN(1.0, confidence + 0.05), source_count = source_count + 1,

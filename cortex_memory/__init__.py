@@ -9,4 +9,4 @@ Frankenstein design combining:
 Single SQLite database. No mandatory external services, no mandatory LLM API key.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

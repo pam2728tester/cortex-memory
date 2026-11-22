@@ -1,11 +1,16 @@
 [project]
 name = "cortex-memory"
-version = "0.1.0"
+version = "0.2.0"
 description = "Unified local-first agent memory system (Frankenstein design: OctavianTocan/agent-memory + adeoluo/agent-memory + rohitg00/agentmemory + TAIPANBOX/engram)"
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+mcp = ["mcp>=1.0,<2"]
+test = ["pytest", "mcp>=1.0,<2"]
+
 [project.scripts]
 cortex = "cortex_memory.cli:main"
+cortex-mcp = "cortex_memory.mcp_server:main"
 
 [build-system]
 requires = ["setuptools>=61"]
