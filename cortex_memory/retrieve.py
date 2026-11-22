@@ -86,34 +86,63 @@ def _rrf_merge(*ranked_lists, weights=None):
     return scores
 
 
-def query(conn, namespace_id, text, limit=10, token_budget=DEFAULT_TOKEN_BUDGET):
-    """Full read-path entry point. Returns an assembled context dict."""
+def query(conn, namespace_id, text, limit=10, token_budget=DEFAULT_TOKEN_BUDGET,
+          global_namespace_id=None, min_confidence=0.0, exclude_episode_ids=(),
+          include_global=True):
+    """Full read-path entry point. Returns an assembled context dict.
+
+    Searches the project namespace and (by default) the global one. Each
+    namespace gets its OWN BM25 ranking (raw BM25 scores are not comparable
+    across indexes), then all ranked lists are fused with weighted RRF so a
+    large namespace cannot drown a small, more relevant one. Project hits
+    outrank global hits of equal relevance (weights in namespaces.py).
+    """
+    from .namespaces import (WEIGHT_GLOBAL_FTS, WEIGHT_GLOBAL_GRAPH,
+                             WEIGHT_PROJECT_FTS, WEIGHT_PROJECT_GRAPH)
+
     fts_query = _fts_escape(text)
+    scopes = []   # (namespace_id, fts_weight, graph_weight, label)
+    if namespace_id:
+        scopes.append((namespace_id, WEIGHT_PROJECT_FTS, WEIGHT_PROJECT_GRAPH, "project"))
+    if include_global and global_namespace_id and global_namespace_id != namespace_id:
+        scopes.append((global_namespace_id, WEIGHT_GLOBAL_FTS, WEIGHT_GLOBAL_GRAPH, "global"))
 
-    bm25_facts = _bm25_facts(conn, namespace_id, fts_query)
-    bm25_episodes = _bm25_episodes(conn, namespace_id, fts_query)
-    graph_facts = _graph_expand(conn, namespace_id, text)
+    ranked, weights, fact_rows, ns_of = [], [], {}, {}
+    episodes = []
+    for ns_id, w_fts, w_graph, label in scopes:
+        bm25 = list(_bm25_facts(conn, ns_id, fts_query))
+        graph = list(_graph_expand(conn, ns_id, text))
+        ranked += [bm25, graph]
+        weights += [w_fts, w_graph]
+        for r in bm25 + graph:
+            fact_rows[r["id"]] = r
+            ns_of[r["id"]] = label
+        episodes += [(label, e) for e in _bm25_episodes(conn, ns_id, fts_query)
+                     if e["id"] not in exclude_episode_ids]
 
-    fact_rows = {r["id"]: r for r in list(bm25_facts) + list(graph_facts)}
-    fused = _rrf_merge(list(bm25_facts), list(graph_facts), weights=[1.0, 0.7])
-
+    fused = _rrf_merge(*ranked, weights=weights) if ranked else {}
+    top = max(fused.values()) if fused else 1.0
     scored = []
     for fid, rrf_score in fused.items():
         row = fact_rows[fid]
-        confidence = row["confidence"] or 0.5
-        importance = row["importance"] or 0.5
-        temporal = _recency_score(row["last_accessed_at"])
-        final = 0.6 * rrf_score + 0.15 * confidence + 0.15 * importance + 0.10 * temporal
-        scored.append((final, row))
+        confidence = row["confidence"] if row["confidence"] is not None else 0.5
+        if confidence < min_confidence:
+            continue
+        importance = row["importance"] if row["importance"] is not None else 0.5
+        # Relevance dominates; confidence/importance only nudge (+-10%).
+        quality = 0.5 * confidence + 0.5 * importance
+        final = (rrf_score / top) * (0.9 + 0.2 * quality)
+        scored.append((final, row, ns_of[fid]))
     scored.sort(key=lambda x: x[0], reverse=True)
+    scored = scored[:limit]
 
-    for _, row in scored[:limit]:
+    for _, row, _ in scored:
         conn.execute(
             "UPDATE facts SET last_accessed_at = datetime('now'), access_count = access_count + 1 WHERE id = ?",
             (row["id"],),
         )
-
-    return _assemble_context(namespace_id, scored[:limit], list(bm25_episodes)[:5], token_budget)
+    episodes.sort(key=lambda le: (le[0] != "project",))   # project history first (stable)
+    return _assemble_context(namespace_id, scored, [e for _, e in episodes][:5], token_budget)
 
 
 def _recency_score(last_accessed_at) -> float:
@@ -122,13 +151,25 @@ def _recency_score(last_accessed_at) -> float:
     return 0.8  # placeholder weighting; refined by decay.py's importance recalculation
 
 
+def _display(row) -> str:
+    """Human line for a fact: multi-valued predicates are `kind:hash` -> show `[kind] object`."""
+    pred = row["predicate"]
+    if ":" in pred:
+        kind, tail = pred.split(":", 1)
+        if kind in ("preference", "decision", "stack", "file", "note", "command", "error", "error_fix"):
+            return f"[{kind.replace('_', '-')}] {row['object']}"
+        if kind == "uses":
+            return f"[stack] project uses {row['object']} as the {tail}"
+    return f"{row['subject']} {pred} {row['object']}"
+
+
 def _assemble_context(namespace_id, scored_facts, episodes, token_budget):
     lines = ["=== CORTEX MEMORY CONTEXT ==="]
     if scored_facts:
         lines.append("KNOWLEDGE:")
-        for _, row in scored_facts:
-            lines.append(f"- {row['subject']} {row['predicate']} {row['object']} "
-                         f"(confidence={row['confidence']:.2f})  [fact:{row['id'][:8]}]")
+        for _, row, label in scored_facts:
+            scope = "" if label == "project" else " (global)"
+            lines.append(f"- {_display(row)}{scope}  [fact:{row['id'][:8]}]")
     if episodes:
         lines.append("RELEVANT HISTORY:")
         for row in episodes:
@@ -140,4 +181,5 @@ def _assemble_context(namespace_id, scored_facts, episodes, token_budget):
     char_budget = token_budget * 4
     if len(text) > char_budget:
         text = text[:char_budget] + "\n[... truncated to fit token budget ...]"
-    return {"text": text, "facts": [r["id"] for _, r in scored_facts], "episodes": [r["id"] for r in episodes]}
+    return {"text": text, "facts": [r["id"] for _, r, _ in scored_facts], "episodes": [r["id"] for r in episodes],
+            "scopes": {r["id"]: label for _, r, label in scored_facts}}

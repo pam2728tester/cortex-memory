@@ -135,7 +135,7 @@ def _sentences(text: str) -> list[str]:
 
 
 def _clean(s: str) -> str:
-    s = re.sub(r"\s+", " ", s).strip().rstrip(",;:")
+    s = re.sub(r"\s+", " ", s).strip().rstrip(",;:.!")
     return s[:MAX_LEN].rstrip()
 
 

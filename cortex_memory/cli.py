@@ -4,7 +4,7 @@ import argparse
 import json
 import sys
 
-from . import capture, db, decay, retrieve, snapshot
+from . import capture, db, decay, namespaces, retrieve, snapshot
 
 
 def cmd_init(args):
@@ -23,6 +23,7 @@ def cmd_capture(args):
     try:
         ns = _resolve_namespace(conn, args.namespace)
         result = capture.ingest(conn, ns, args.event_type, args.content, source_type=args.source)
+        result["stats"] = result["stats"].as_dict()
         print(json.dumps(result, indent=2))
     finally:
         conn.close()
@@ -31,9 +32,32 @@ def cmd_capture(args):
 def cmd_query(args):
     conn = db.connect()
     try:
-        ns = _resolve_namespace(conn, args.namespace)
-        result = retrieve.query(conn, ns, args.text, limit=args.limit)
+        if args.cwd:
+            scope = namespaces.resolve(conn, args.cwd)
+            ns, gl = scope["project"] or scope["global"], scope["global"]
+        else:
+            ns, gl = _resolve_namespace(conn, args.namespace), None
+        result = retrieve.query(conn, ns, args.text, limit=args.limit, global_namespace_id=gl)
         print(result["text"])
+    finally:
+        conn.close()
+
+
+def cmd_consolidate(args):
+    conn = db.connect()
+    try:
+        if not args.no_snapshot:
+            snapshot.create(reason="before_namespace_consolidation")
+        print(json.dumps(namespaces.consolidate_legacy(conn), indent=2))
+    finally:
+        conn.close()
+
+
+def cmd_promote(args):
+    conn = db.connect()
+    try:
+        fid, op = namespaces.promote(conn, args.fact_id, args.to)
+        print(json.dumps({"fact_id": fid, "op": op}))
     finally:
         conn.close()
 
@@ -81,7 +105,17 @@ def main():
     pq.add_argument("text")
     pq.add_argument("--namespace", default=None)
     pq.add_argument("--limit", type=int, default=10)
+    pq.add_argument("--cwd", default=None, help="resolve project (git root) + global from this directory")
     pq.set_defaults(func=cmd_query)
+
+    pn = sub.add_parser("consolidate-namespaces", help="merge legacy per-cwd namespaces into git-root namespaces")
+    pn.add_argument("--no-snapshot", action="store_true")
+    pn.set_defaults(func=cmd_consolidate)
+
+    pp = sub.add_parser("promote", help="copy an active fact into the global namespace")
+    pp.add_argument("fact_id")
+    pp.add_argument("--to", default=namespaces.GLOBAL_NAME)
+    pp.set_defaults(func=cmd_promote)
 
     pd = sub.add_parser("decay")
     pd.add_argument("--namespace", default=None)

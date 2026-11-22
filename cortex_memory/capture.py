@@ -159,10 +159,16 @@ def ingest(conn, namespace_id, event_type, content, tool=None, **kwargs) -> dict
     else:
         cands = extract.extract_text(content, stats)
         cands += extract.extract_llm(content, stats)
+    global_id = None
     for cand in cands:
+        target = namespace_id
+        if cand.kind == "preference":
+            # Personal preferences apply to every project: store them globally.
+            global_id = global_id or db.ensure_default_namespace(conn)
+            target = global_id
         if cand.kind == "command":
             _pair_error_fix(conn, namespace_id, cand, episode_id, results)
-        fid, op = merge_fact(conn, namespace_id, _to_fact(cand, episode_id))
+        fid, op = merge_fact(conn, target, _to_fact(cand, episode_id))
         results["facts"].append({"fact_id": fid, "op": op, "predicate": cand.predicate, "kind": cand.kind})
     _log_stats(event_type, stats, len(results["facts"]))
     return results

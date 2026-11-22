@@ -21,9 +21,10 @@ def test_user_message_creates_facts(conn, ns):
 
 
 def test_reinforcement_not_duplicate(conn, ns):
-    capture.ingest(conn, ns, "user_message", "Always run pytest before committing.", source_type="user_provided")
-    capture.ingest(conn, ns, "user_message", "Always run pytest before committing!", source_type="user_provided")
-    assert len(facts(conn, ns)) == 1
+    capture.ingest(conn, ns, "user_message", "We decided to use SQLite.", source_type="user_provided")
+    capture.ingest(conn, ns, "user_message", "We decided to use SQLite!", source_type="user_provided")
+    rows = conn.execute("SELECT source_count FROM facts WHERE namespace_id=?", (ns,)).fetchall()
+    assert len(rows) == 1 and rows[0]["source_count"] == 2
 
 
 def test_single_valued_supersedes(conn, ns):

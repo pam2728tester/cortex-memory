@@ -3,7 +3,7 @@
 
 import sys
 
-from _shared import additional_context, read_hook_input, safe_namespace, run_safely
+from _shared import additional_context, read_hook_input, run_safely, safe_namespaces
 
 sys.path.insert(0, str(__file__).rsplit("cortex_memory", 1)[0])
 from cortex_memory import db, retrieve  # noqa: E402
@@ -14,10 +14,12 @@ def main():
     cwd = payload.get("cwd")
     try:
         db.init_db()
-        ns = safe_namespace(cwd)
+        scope = safe_namespaces(cwd)
+        ns = scope["project"] or scope["global"]
         conn = db.connect()
         try:
-            result = retrieve.query(conn, ns, "project profile current task unfinished", limit=8)
+            result = retrieve.query(conn, ns, "project profile current task unfinished preference decision stack",
+                                    limit=8, global_namespace_id=scope["global"])
         finally:
             conn.close()
         if result["facts"] or result["episodes"]:

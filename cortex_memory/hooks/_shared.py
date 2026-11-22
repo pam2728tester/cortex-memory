@@ -36,13 +36,20 @@ def additional_context(hook_event_name: str, text: str) -> None:
     }))
 
 
-def safe_namespace(cwd: str | None) -> str:
+def safe_namespaces(cwd: str | None) -> dict:
+    """{'project': id|None, 'global': id} resolved from the session cwd (git root, not raw cwd)."""
+    from cortex_memory import namespaces
     conn = db.connect()
     try:
-        name = f"project:{cwd}" if cwd else "global:user"
-        return db.get_or_create_namespace(conn, name, "project" if cwd else "global")
+        return namespaces.resolve(conn, cwd)
     finally:
         conn.close()
+
+
+def safe_namespace(cwd: str | None) -> str:
+    """Primary namespace id for a cwd: its project, or the global one when there is no cwd."""
+    ns = safe_namespaces(cwd)
+    return ns["project"] or ns["global"]
 
 
 def run_safely(main) -> None:

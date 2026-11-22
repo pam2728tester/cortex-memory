@@ -3,7 +3,7 @@
 
 import sys
 
-from _shared import additional_context, read_hook_input, safe_namespace, run_safely
+from _shared import additional_context, read_hook_input, run_safely, safe_namespaces
 
 sys.path.insert(0, str(__file__).rsplit("cortex_memory", 1)[0])
 from cortex_memory import capture, db, retrieve  # noqa: E402
@@ -36,11 +36,13 @@ def main():
     if not prompt or is_noise(prompt):
         sys.exit(0)
     try:
-        ns = safe_namespace(cwd)
+        scope = safe_namespaces(cwd)
+        ns = scope["project"] or scope["global"]
         conn = db.connect()
         try:
-            capture.ingest(conn, ns, "user_message", prompt, source_type="user_provided")
-            result = retrieve.query(conn, ns, prompt, limit=8)
+            ingested = capture.ingest(conn, ns, "user_message", prompt, source_type="user_provided")
+            result = retrieve.query(conn, ns, prompt, limit=8, global_namespace_id=scope["global"],
+                                    exclude_episode_ids={ingested["episode_id"]})
         finally:
             conn.close()
         if result["facts"] or result["episodes"]:
